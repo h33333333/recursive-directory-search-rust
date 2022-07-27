@@ -45,46 +45,51 @@ impl Config {
 fn search_in_path(path: &PathBuf, query: String, tx: mpsc::Sender<String>) {
     if path.is_dir() {
         let mut handles = vec![];
-        // We need this loop because sometimes there will be an os error 24 (too many open file) when searching in big directories
-        // And we will have to wait for some thread to finish and free the resources
-        // If we don't use loop here - some directories won't be scanned due to aforementioned
-        // error and this will result in an undefined behaviour
-        let paths = loop {
-            match fs::read_dir(path) {
-                Ok(paths) => break paths,
-                Err(e) => match e.kind() {
-                    std::io::ErrorKind::PermissionDenied => {
-                        println!("Permission denied: {}", path.to_string_lossy());
-                        return;
-                    }
-                    _ => {
-                        // Too many open files -> wait for 1000 nanoseconds and retry
-                        if e.to_string().contains("os error 24") {
-                            std::thread::sleep(std::time::Duration::from_nanos(1000));
-                            continue;
-                        } else {
-                            println!("Unexpected error during directory iteration: {}", e);
+        // Here we create inner block so our paths variable goes out of scope and frees resources,
+        // preventing from deadlock when we iterate over a big directory and reach maximum amount
+        // of open files and all of them are directories (read_dir creates file handle)
+        {
+            // We need this loop because sometimes there will be an os error 24 (too many open file) when searching in big directories
+            // And we will have to wait for some thread to finish and free the resources
+            // If we don't use loop here - some directories won't be scanned due to aforementioned
+            // error and this will result in an undefined behaviour
+            let paths = loop {
+                match fs::read_dir(path) {
+                    Ok(paths) => break paths,
+                    Err(e) => match e.kind() {
+                        std::io::ErrorKind::PermissionDenied => {
+                            println!("Permission denied: {}", path.to_string_lossy());
                             return;
                         }
+                        _ => {
+                            // Too many open files -> wait for 1000 nanoseconds and retry
+                            if e.to_string().contains("os error 24") {
+                                std::thread::sleep(std::time::Duration::from_nanos(1000));
+                                continue;
+                            } else {
+                                println!("Unexpected error during directory iteration: {}", e);
+                                return;
+                            }
+                        }
+                    },
+                };
+            };
+            for sub_path in paths {
+                let sub_path = match sub_path {
+                    Ok(path) => path,
+                    Err(e) => {
+                        println!(
+                            "Unexpected error happened during directory iteration: {}",
+                            e
+                        );
+                        continue;
                     }
-                },
-            };
-        };
-        for sub_path in paths {
-            let sub_path = match sub_path {
-                Ok(path) => path,
-                Err(e) => {
-                    println!(
-                        "Unexpected error happened during directory iteration: {}",
-                        e
-                    );
-                    continue;
-                }
-            };
-            let tx = tx.clone();
-            let query = query.clone();
-            let handle = thread::spawn(move || search_in_path(&sub_path.path(), query, tx));
-            handles.push(handle);
+                };
+                let tx = tx.clone();
+                let query = query.clone();
+                let handle = thread::spawn(move || search_in_path(&sub_path.path(), query, tx));
+                handles.push(handle);
+            }
         }
         for handle in handles {
             match handle.join() {
